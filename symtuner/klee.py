@@ -16,6 +16,143 @@ from symtuner.symbolic_executor import SymbolicExecutor
 from symtuner.symtuner import SymTuner
 
 
+# ---------------------------------------------------------
+#  helpers for sniffles: pgm --help 에서 랜덤 옵션 뽑기
+#  + pgm별 program arguments 구성
+# ---------------------------------------------------------
+
+_opt_cache = {}  # pgm별 help 옵션 캐시
+
+
+def _random_opt_from_help(pgm: str):
+    """
+    주어진 프로그램(pgm)의 '--help' 출력에서 옵션 후보를 모아서
+    그 중 하나를 랜덤으로 리턴한다.
+    실패하거나 후보가 없으면 None 리턴.
+    """
+    if not pgm:
+        return None
+
+    if pgm in _opt_cache and _opt_cache[pgm]:
+        return random.choice(_opt_cache[pgm])
+
+    try:
+        out = sp.check_output(
+            [pgm, "--help"],
+            stderr=sp.STDOUT,
+            text=True,
+        )
+    except Exception:
+        # 네이티브 바이너리가 없거나 실행 실패시
+        return None
+
+    candidates = set()
+
+    # 공백 기준으로 자르고, '-'로 시작하는 토큰들만 후보로 사용
+    # (뒤에 붙은 ',', '.', ';', ')' 등은 제거)
+    for tok in out.split():
+        if not tok.startswith("-"):
+            continue
+        tok = tok.rstrip(".,;:)")
+        # 도와주는 옵션들은 제외
+        if tok in ("-h", "--help", "--version"):
+            continue
+        # 너무 이상한 것들은 제외 (예: 길이 1짜리 '-' 등)
+        if tok == "-" or tok == "--":
+            continue
+        candidates.add(tok)
+
+    _opt_cache[pgm] = sorted(candidates)
+    if not _opt_cache[pgm]:
+        return None
+    return random.choice(_opt_cache[pgm])
+
+
+def _build_sniffles_prog_args(pgm: str, base_prog_args, regex_token: str):
+    """
+    sniffles 모드에서 사용할 program arguments (bitcode 뒤에 붙는 부분)를
+    pgm별 스펙에 맞게 구성한다.
+
+    base_prog_args : 원래 SymTuner가 쓰던 program args
+                     (sym-arg, sym-files, sym-stdin, sym-stdout 등)
+    regex_token    : SymTuner main에서 만들어준, 이미 적절히 escape된 정규식 인자 하나
+                     (예: "\"...escaped...\"")
+    """
+    pgm = pgm or ""
+    prog_args = []
+
+    # 편의용: 랜덤 옵션 prefix (리스트 버전)
+    def _opt_list():
+        opt = _random_opt_from_help(pgm)
+        return [opt] if opt else []
+
+    if pgm == "diff":
+        # diff:
+        #   -opt regex /home/.../diff.c /home/.../diff3.c base_prog_args
+        prog_args.extend(_opt_list())
+        (
+            prog_args.append(regex_token)
+        ) if regex_token is not None else None
+        prog_args.extend([
+            "/home/eunki/FeatMaker/benchmarks/diffutils-3.7/src/diff.c",
+            "/home/eunki/FeatMaker/benchmarks/diffutils-3.7/src/diff3.c",
+        ])
+        prog_args.extend(base_prog_args)
+
+    elif pgm == "find":
+        # find:
+        #   -opt regex base_prog_args
+        prog_args.extend(_opt_list())
+        (
+            prog_args.append(regex_token)
+        ) if regex_token is not None else None
+        prog_args.extend(base_prog_args)
+
+    elif pgm == "gawk":
+        # gawk:
+        #   base_prog_args regex /home/.../gawkmisc.c /home/.../*.c
+        # (명세상 -opt 없음)
+        prog_args.extend(base_prog_args)
+        (
+            prog_args.append(regex_token)
+        ) if regex_token is not None else None
+        prog_args.extend([
+            "/home/eunki/FeatMaker/benchmarks/gawk-5.1.0/gawkmisc.c",
+            "/home/eunki/FeatMaker/benchmarks/gawk-5.1.0/*.c",
+        ])
+
+    elif pgm == "gcal":
+        # gcal:
+        #   -opt /home/.../de-sdata.rc -opt regex base_prog_args
+        # 여기서 -opt 들은 각각 랜덤 옵션으로 대체
+        prog_args.extend(_opt_list())
+        prog_args.append("/home/eunki/FeatMaker/benchmarks/gcal-4.1/data/de-sdata.rc")
+        prog_args.extend(_opt_list())
+        (
+            prog_args.append(regex_token)
+        ) if regex_token is not None else None
+        prog_args.extend(base_prog_args)
+
+    elif pgm == "sed":
+        # sed:
+        #   -opt regex /home/.../doc/*.texi base_prog_args
+        prog_args.extend(_opt_list())
+        (
+            prog_args.append(regex_token)
+        ) if regex_token is not None else None
+        prog_args.append("/home/eunki/FeatMaker/benchmarks/sed-4.8/doc/*.texi")
+        prog_args.extend(base_prog_args)
+
+    else:
+        # 기타 프로그램: 기존 동작과 동일하게 regex를 앞에 붙이기
+        if regex_token is not None:
+            prog_args = [regex_token] + list(base_prog_args)
+        else:
+            prog_args = list(base_prog_args)
+
+    return prog_args
+
+
 class GCov:
     '''GCov executable wrapper
 
@@ -152,8 +289,9 @@ class KLEE(SymbolicExecutor):
         Args:
             target: LLVM byte code file.
             parameters: A dictionary with KLEE parameters.
-            kwargs: Symbolic executor specific keyword arguments. This is just for compatability
-                with other symbolic executors.
+            kwargs: Symbolic executor specific keyword arguments.
+                - pgm (str): program name (diff, find, gawk, gcal, sed, ...)
+                - sniffles_option (bool): if True, use Sniffles-style regex injection.
 
         Returns:
             A list of testcases (`.ktest` files) founds.
@@ -163,6 +301,10 @@ class KLEE(SymbolicExecutor):
         '''
 
         target = Path(target).absolute()
+
+        # sniffles 연동용 kwargs
+        pgm = kwargs.get('pgm')
+        sniffles_option = kwargs.get('sniffles_option', False)
 
         # Convert to absolute path if output-dir option is set
         possible_output_dir = ['-output-dir', '--output-dir']
@@ -177,6 +319,7 @@ class KLEE(SymbolicExecutor):
         os.chdir(str(target.parent))
 
         # Build command
+        seed_priority_opts = []      # seed 관련 옵션
         klee_options = []
         # Program arguments: -sym-arg[s] -sym-files -sym-stdin -sym-stdout
         sym_arg_options = []
@@ -187,6 +330,14 @@ class KLEE(SymbolicExecutor):
         space_seperate_keys = ['sym-arg', 'sym-args',
                                'sym-files', 'sym-stdin']
         sym_arg_keys = ['sym-arg', 'sym-args']
+        seed_order = [
+            'allow-seed-extention',
+            'allow-seed-truncation',
+            'seed-file',
+            'seed-time',
+        ]
+        seed_bucket = {k: [] for k in seed_order}
+
         for key, values in parameters.items():
             stripped_key = key.strip('-').split()[0]
             if not isinstance(values, list):
@@ -200,8 +351,13 @@ class KLEE(SymbolicExecutor):
                     if value == 'off':
                         continue
                     param = key
+                elif stripped_key == 'sym_regex_options':
+                    # 이 키는 KLEE 옵션이 아니므로 여기서는 스킵하고,
+                    # 아래에서 program arguments 구성 시 사용한다.
+                    continue
                 else:
                     param = f'{key}={value}'
+
                 if stripped_key in sym_arg_keys:
                     sym_arg_options.append(param)
                 elif stripped_key == 'sym-files':
@@ -210,10 +366,45 @@ class KLEE(SymbolicExecutor):
                     sym_stdin_options.append(param)
                 elif stripped_key == 'sym-stdout':
                     sym_stdout_options.append(param)
+                elif stripped_key in seed_bucket:
+                    seed_bucket[stripped_key].append(param)
                 else:
                     klee_options.append(param)
-        cmd = [str(self.bin), *klee_options, str(target),
-               *sym_arg_options, *sym_files_options, *sym_stdin_options, *sym_stdout_options]
+
+        seed_priority_opts = [p for k in seed_order for p in seed_bucket[k]]
+
+        # --- base program args (bitcode 뒤에 붙는 인자들) ---
+        base_prog_args = (
+            sym_arg_options +
+            sym_files_options +
+            sym_stdin_options +
+            sym_stdout_options
+        )
+
+        # --- sym_regex_options로부터 선택된 정규식 1개를 가져온다 (있을 때만) ---
+        regex_token = None
+        raw_sel = parameters.get('sym_regex_options', None)
+        if isinstance(raw_sel, (list, tuple)) and len(raw_sel) == 1 and isinstance(raw_sel[0], str):
+            regex_token = raw_sel[0]
+
+        # --- sniffles 모드라면 pgm별 규칙에 따라 program arguments 구성 ---
+        if sniffles_option and pgm:
+            prog_args = _build_sniffles_prog_args(pgm, base_prog_args, regex_token)
+        else:
+            # 기존 동작: sym_regex_options가 있으면 bitcode 뒤에 그대로 붙이고,
+            # 그 다음에 sym-arg / sym-files / sym-stdin / sym-stdout 순으로 붙인다.
+            if regex_token is not None:
+                prog_args = [regex_token] + base_prog_args
+            else:
+                prog_args = list(base_prog_args)
+
+        cmd = [
+            str(self.bin),
+            *seed_priority_opts,
+            *klee_options,
+            str(target),
+            *prog_args,
+        ]
 
         # Run KLEE
         cmd = ' '.join(cmd)
@@ -223,7 +414,8 @@ class KLEE(SymbolicExecutor):
                        shell=True, check=True)
         except sp.CalledProcessError as e:
             stderr = e.stderr.decode(errors='replace')
-            lastline = stderr.strip().splitlines()[-1]
+            lines = stderr.strip().splitlines()
+            lastline = lines[-1] if lines else ''
             if 'KLEE' in lastline and 'kill(9)' in lastline:
                 get_logger().warning(f'KLEE process kill(9)ed. Failed to terminate nicely.')
             else:
@@ -261,7 +453,6 @@ class KLEE(SymbolicExecutor):
         os.chdir(str(original_path))
 
         return testcases
-
     def get_time_parameter(self):
         '''Paramter to set time budget
 
